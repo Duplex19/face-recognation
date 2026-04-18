@@ -1,5 +1,4 @@
 import os
-import pickle
 import logging
 import tempfile
 import re
@@ -8,7 +7,8 @@ from functools import lru_cache
 from typing import Optional
 
 import httpx
-import numpy as np
+import chromadb
+from chromadb.config import Settings as ChromaSettings
 from deepface import DeepFace
 from fastapi import FastAPI, HTTPException, status
 from pydantic import BaseModel, field_validator
@@ -22,7 +22,7 @@ from spoof_detector import detect_spoof
 # =========================
 
 class Settings(BaseSettings):
-    embed_dir: str = "embeddings"
+    embed_dir: str = "embeddings"        # Dipakai ChromaDB sebagai persist_directory
     face_model: str = "Facenet"
     detector_backend: str = "opencv"
     verify_threshold: float = 0.6
@@ -50,49 +50,108 @@ logger = logging.getLogger("face_api")
 
 
 # =========================
-# IN-MEMORY CACHE
+# VECTOR STORE (ChromaDB)
 # =========================
 
-_embedding_cache: dict[str, list[float]] = {}
+_chroma_client: Optional[chromadb.PersistentClient] = None
+_collection: Optional[chromadb.Collection] = None
 
+COLLECTION_NAME = "face_embeddings"
+
+
+def get_collection() -> chromadb.Collection:
+    """Return the ChromaDB collection (singleton)."""
+    if _collection is None:
+        raise RuntimeError("Vector store not initialized. Call init_vector_store() first.")
+    return _collection
+
+
+def init_vector_store(persist_directory: str) -> int:
+    """
+    Initialize ChromaDB dengan persistent storage.
+    Mengembalikan jumlah embedding yang sudah tersimpan.
+    """
+    global _chroma_client, _collection
+
+    os.makedirs(persist_directory, exist_ok=True)
+
+    _chroma_client = chromadb.PersistentClient(
+        path=persist_directory,
+        settings=ChromaSettings(anonymized_telemetry=False),
+    )
+
+    # cosine distance → similarity = 1 - distance
+    _collection = _chroma_client.get_or_create_collection(
+        name=COLLECTION_NAME,
+        metadata={"hnsw:space": "cosine"},
+    )
+
+    count = _collection.count()
+    logger.info(f"ChromaDB initialized — {count} embeddings loaded from '{persist_directory}'")
+    return count
+
+
+# ── CRUD helpers ─────────────────────────────────────────────
 
 def load_embedding(user_id: str) -> Optional[list[float]]:
-    if user_id in _embedding_cache:
-        return _embedding_cache[user_id]
+    """Ambil embedding berdasarkan user_id. Return None jika tidak ditemukan."""
+    col = get_collection()
+    result = col.get(ids=[user_id], include=["embeddings"])
 
-    cfg = get_settings()
-    path = os.path.join(cfg.embed_dir, f"{user_id}.pkl")
-
-    if not os.path.exists(path):
+    if not result["ids"]:
         return None
 
-    with open(path, "rb") as f:
-        embedding = pickle.load(f)
-
-    _embedding_cache[user_id] = embedding
-    return embedding
+    return result["embeddings"][0]
 
 
 def save_embedding(user_id: str, embedding: list[float]) -> None:
-    cfg = get_settings()
-    path = os.path.join(cfg.embed_dir, f"{user_id}.pkl")
+    """Simpan atau update embedding untuk user_id."""
+    col = get_collection()
 
-    with open(path, "wb") as f:
-        pickle.dump(embedding, f)
-
-    _embedding_cache[user_id] = embedding
+    # upsert: insert jika baru, update jika sudah ada
+    col.upsert(
+        ids=[user_id],
+        embeddings=[embedding],
+        metadatas=[{"user_id": user_id}],
+    )
 
 
 def delete_embedding(user_id: str) -> bool:
-    cfg = get_settings()
-    path = os.path.join(cfg.embed_dir, f"{user_id}.pkl")
+    """Hapus embedding. Return True jika berhasil, False jika user tidak ada."""
+    col = get_collection()
 
-    _embedding_cache.pop(user_id, None)
+    result = col.get(ids=[user_id])
+    if not result["ids"]:
+        return False
 
-    if os.path.exists(path):
-        os.remove(path)
-        return True
-    return False
+    col.delete(ids=[user_id])
+    return True
+
+
+def query_similar(embedding: list[float], top_k: int = 1) -> list[dict]:
+    """
+    Opsional: cari embedding paling mirip di seluruh collection.
+    Berguna untuk identifikasi (1:N matching).
+    Mengembalikan list of {"user_id", "similarity", "distance"}.
+    """
+    col = get_collection()
+
+    if col.count() == 0:
+        return []
+
+    results = col.query(
+        query_embeddings=[embedding],
+        n_results=min(top_k, col.count()),
+        include=["metadatas", "distances"],
+    )
+
+    output = []
+    for uid, dist in zip(results["ids"][0], results["distances"][0]):
+        # ChromaDB cosine: distance = 1 - cosine_similarity
+        similarity = round(1.0 - dist, 4)
+        output.append({"user_id": uid, "similarity": similarity, "distance": round(dist, 4)})
+
+    return output
 
 
 # =========================
@@ -102,15 +161,8 @@ def delete_embedding(user_id: str) -> bool:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     cfg = get_settings()
-    os.makedirs(cfg.embed_dir, exist_ok=True)
-
-    loaded = 0
-    for fname in os.listdir(cfg.embed_dir):
-        if fname.endswith(".pkl"):
-            user_id = fname[:-4]
-            if load_embedding(user_id):
-                loaded += 1
-    logger.info(f"Pre-loaded {loaded} embeddings into cache")
+    count = init_vector_store(cfg.embed_dir)
+    logger.info(f"Face API ready — {count} users registered")
 
     yield
 
@@ -134,9 +186,7 @@ _SAFE_ID = re.compile(r"^[a-zA-Z0-9_\-]{1,64}$")
 class FaceRequest(BaseModel):
     user_id: str
     image_url: str
-    # anti_spoofing sekarang selalu True secara default
     anti_spoofing: bool = True
-    # expose raw scores untuk debugging (jangan aktifkan di production)
     debug: bool = False
 
     @field_validator("user_id")
@@ -211,19 +261,11 @@ def extract_embedding(img_path: str, cfg: Settings) -> list[float]:
             img_path=img_path,
             model_name=cfg.face_model,
             enforce_detection=True,
-            detector_backend=cfg.detector_backend
+            detector_backend=cfg.detector_backend,
         )
         return results[0]["embedding"]
     except Exception as e:
         raise ValueError(f"Face not detected: {e}") from e
-
-
-def cosine_similarity(a: list[float], b: list[float]) -> float:
-    va, vb = np.array(a), np.array(b)
-    denom = np.linalg.norm(va) * np.linalg.norm(vb)
-    if denom == 0:
-        return 0.0
-    return float(np.dot(va, vb) / denom)
 
 
 # =========================
@@ -238,19 +280,14 @@ async def register(data: FaceRequest):
     try:
         temp_path = await download_image(data.image_url)
 
-        # ── Anti-spoofing (multi-layer) ──────────────────────────
         if data.anti_spoofing:
             spoof_result = detect_spoof(temp_path)
             if not spoof_result.is_real:
-                resp = {
-                    "status": False,
-                    "message": spoof_result.reason or "Spoof detected",
-                }
+                resp = {"status": False, "message": spoof_result.reason or "Spoof detected"}
                 if data.debug:
                     resp["spoof_scores"] = spoof_result.scores
                 return resp
 
-        # ── Extract & save embedding ─────────────────────────────
         try:
             embedding = extract_embedding(temp_path, cfg)
         except ValueError as e:
@@ -283,25 +320,39 @@ async def verify(data: VerifyRequest):
     try:
         temp_path = await download_image(data.image_url)
 
-        # ── Anti-spoofing (multi-layer) ──────────────────────────
         if data.anti_spoofing:
             spoof_result = detect_spoof(temp_path)
             if not spoof_result.is_real:
-                resp = {
-                    "status": False,
-                    "message": spoof_result.reason or "Spoof detected",
-                }
+                resp = {"status": False, "message": spoof_result.reason or "Spoof detected"}
                 if data.debug:
                     resp["spoof_scores"] = spoof_result.scores
                 return resp
 
-        # ── Extract & compare embedding ──────────────────────────
         try:
             new_embedding = extract_embedding(temp_path, cfg)
         except ValueError as e:
             return {"status": False, "message": str(e)}
 
-        similarity = cosine_similarity(stored_embedding, new_embedding)
+        # ── Cosine similarity via ChromaDB query ─────────────────
+        # Query top-1 untuk user_id ini secara langsung dari stored_embedding
+        matches = query_similar(new_embedding, top_k=1)
+
+        # Filter hasil hanya untuk user_id yang diminta
+        similarity = 0.0
+        for match in matches:
+            if match["user_id"] == data.user_id:
+                similarity = match["similarity"]
+                break
+
+        # Fallback: hitung manual jika query tidak return user ini
+        # (terjadi bila ada lebih banyak user & top_k terlalu kecil)
+        if similarity == 0.0:
+            import numpy as np
+            va = np.array(stored_embedding)
+            vb = np.array(new_embedding)
+            denom = np.linalg.norm(va) * np.linalg.norm(vb)
+            similarity = float(np.dot(va, vb) / denom) if denom else 0.0
+
         verified = similarity >= threshold
 
         logger.info(
@@ -340,12 +391,56 @@ async def delete_user(user_id: str):
 
 @app.get("/health")
 async def health():
+    col = get_collection()
+    registered = col.count()
     cfg = get_settings()
-    registered = len([f for f in os.listdir(cfg.embed_dir) if f.endswith(".pkl")])
     return {
         "status": "ok",
         "registered_users": registered,
-        "cached_users": len(_embedding_cache),
+        "vector_store": "chromadb",
         "model": cfg.face_model,
         "detector": cfg.detector_backend,
     }
+
+
+# ── Endpoint baru: identifikasi 1:N (bonus) ──────────────────
+
+@app.post("/identify")
+async def identify(data: FaceRequest, top_k: int = 5):
+    """
+    Cari siapa pemilik wajah dari seluruh database (1:N matching).
+    Mengembalikan top-K kandidat beserta similarity score.
+    """
+    cfg = get_settings()
+    temp_path = None
+
+    try:
+        temp_path = await download_image(data.image_url)
+
+        if data.anti_spoofing:
+            spoof_result = detect_spoof(temp_path)
+            if not spoof_result.is_real:
+                resp = {"status": False, "message": spoof_result.reason or "Spoof detected"}
+                if data.debug:
+                    resp["spoof_scores"] = spoof_result.scores
+                return resp
+
+        try:
+            embedding = extract_embedding(temp_path, cfg)
+        except ValueError as e:
+            return {"status": False, "message": str(e)}
+
+        candidates = query_similar(embedding, top_k=top_k)
+
+        return {
+            "status": True,
+            "candidates": candidates,   # [{user_id, similarity, distance}, ...]
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Unexpected error during identify")
+        return {"status": False, "message": str(e)}
+    finally:
+        safe_remove(temp_path)
